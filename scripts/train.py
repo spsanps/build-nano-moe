@@ -10,7 +10,7 @@ from torch.distributed import init_process_group, destroy_process_group
 import wandb
 
 from data import DataLoaderLite, iterate_examples, get_most_likely_row
-from model import GPT, GPTConfig
+from GPT import GPT, GPTConfig
 from utils import get_lr
 
 def train(
