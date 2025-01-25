@@ -1,2 +1,6 @@
-edu_fineweb*/*
+data/*
+scripts/log*
+scripts/wandb*
 *.npy
+*.pyc
+*__pycache__*

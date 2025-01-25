@@ -2,6 +2,7 @@
 
 import time
 import torch
+import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -21,11 +22,12 @@ def train(
     B=64,
     T=1024,
     device_type='cuda',
-    data_root='edu_fineweb10B',
+    data_root='../data/edu_fineweb10B',
     log_dir='log',
     project_name='my-gpt-project',
     run_name='my-gpt-run',
-    do_hellaswag=True
+    do_hellaswag=True,
+    sample_model=False,
 ):
     """
     Main training loop.
@@ -62,7 +64,7 @@ def train(
     val_loader   = DataLoaderLite(B, T, ddp_rank, ddp_world_size, split="val",   data_root=data_root)
 
     # create model
-    config = GPTConfig(vocab_size=50304)  # example config
+    config = GPTConfig()  # example config
     model = GPT(config)
     model.to(device)
     raw_model = model  # for logging or checkpoint saving
@@ -91,6 +93,7 @@ def train(
         })
 
     # training loop
+    bar = tqdm.tqdm(total=max_steps, disable=not master_process)
     for step in range(max_steps):
         t0 = time.time()
         last_step = (step == max_steps - 1)
@@ -154,7 +157,7 @@ def train(
                 wandb.log({"hellaswag_accuracy": acc_norm}, step=step)
 
         # --- Optionally sample from the model
-        if master_process and step > 0 and step % 250 == 0:
+        if sample_model and master_process and step > 0 and step % 250 == 0:
             model.eval()
             # (example) top-k sampling from a small prompt
             prompt = "Hello, I'm a language model,"
@@ -184,6 +187,7 @@ def train(
                 print(f"[Sample {i}] {decoded}")
 
         # --- Train step
+
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
@@ -222,7 +226,11 @@ def train(
         tokens_per_sec = tokens_processed / dt
 
         if master_process:
-            print(f"step {step} | loss: {train_loss_val:.4f} | lr: {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            #print(f"step {step} | loss: {train_loss_val:.4f} | lr: {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            # use progress bar
+            bar.set_description(f"loss: {train_loss_val:.4f} | lr: {lr:.4e} | tok/sec: {tokens_per_sec:.2f}")
+            bar.update(1)
+
             wandb.log({"train_loss": train_loss_val, "lr": lr}, step=step)
 
         # (Optional) save checkpoint
@@ -242,3 +250,7 @@ def train(
 
     if master_process:
         wandb.finish()
+
+    # destroy the progress bar
+    if master_process:
+        bar.close()
