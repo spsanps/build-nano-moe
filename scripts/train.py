@@ -10,7 +10,7 @@ from torch.distributed import init_process_group, destroy_process_group
 import wandb
 
 from data import DataLoaderLite, iterate_examples, get_most_likely_row
-from GPT import GPT, GPTConfig
+from nGPT import GPT, GPTConfig
 from utils import get_lr
 
 def train(
@@ -25,7 +25,7 @@ def train(
     data_root='../data/edu_fineweb10B',
     log_dir='log',
     project_name='my-gpt-project',
-    run_name='my-gpt-run',
+    run_name='my-ngpt-run',
     do_hellaswag=True,
     sample_model=False,
 ):
