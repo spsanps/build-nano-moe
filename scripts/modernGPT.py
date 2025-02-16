@@ -4,13 +4,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+################################################################
+# Config
+################################################################
+
 @dataclass
 class ModernGPTConfig:
     block_size: int = 1024
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12        # number of "query" heads
-    n_kv_head: int = 2      # number of "key/value" heads for multi-query
+    n_kv_head: int = 1      # number of "key/value" heads for multi-query
     n_embd: int = 768
     dropout: float = 0.0
     use_bias: bool = True
@@ -18,7 +22,7 @@ class ModernGPTConfig:
     ffn_factor: int = 2           # expansion factor for MLP (SwiGLU etc.)
 
 ################################################################
-# Rope utility
+# RoPE utilities
 ################################################################
 
 def build_sin_cos_rope(seq_len, head_dim, base=10000.0, device=None, dtype=None):
@@ -31,9 +35,8 @@ def build_sin_cos_rope(seq_len, head_dim, base=10000.0, device=None, dtype=None)
         dtype = torch.float32
 
     positions = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(1)
-    # even dims: 0,2,4,...; half as many of them
     dims = torch.arange(0, head_dim, 2, device=device, dtype=dtype)
-    # freq ~ 1/(base^(dim/head_dim))
+    # freq ~ 1/(base^(dims/head_dim))
     freqs = positions / (base ** (dims / head_dim))
     sin = freqs.sin()
     cos = freqs.cos()
@@ -48,20 +51,16 @@ def apply_rope(x, rope_cache):
     x: [B, n_head, T, head_dim]
     rope_cache: [T, head_dim]
     """
-    # shape expansions
-    # rope_cache => (T, head_dim) -> (1, 1, T, head_dim)
+    # rope_cache => (T, head_dim) -> (1,1,T,head_dim)
     sincos = rope_cache.unsqueeze(0).unsqueeze(0)
     sin = sincos[..., 0::2]
     cos = sincos[..., 1::2]
 
-    # separate x into even, odd channels
     x0 = x[..., 0::2]
     x1 = x[..., 1::2]
 
-    # out0 = x0*cos - x1*sin
-    # out1 = x1*cos + x0*sin
-    out0 = x0*cos - x1*sin
-    out1 = x1*cos + x0*sin
+    out0 = x0 * cos - x1 * sin
+    out1 = x1 * cos + x0 * sin
 
     out = torch.zeros_like(x)
     out[..., 0::2] = out0
@@ -96,11 +95,15 @@ class SwiGLU(nn.Module):
         a, b = x.chunk(2, dim=-1)
         return a * F.silu(b)
 
+################################################################
+# MLP
+################################################################
+
 class MLP(nn.Module):
     def __init__(self, config: ModernGPTConfig):
         super().__init__()
         hidden_dim = config.ffn_factor * config.n_embd  # e.g. 2 * n_embd
-        # We'll do c_fc => (n_embd -> 2*hidden_dim). Then split => [a|b], do a*silu(b).
+        # We'll do c_fc => (n_embd -> 2*hidden_dim). Then split => a|b => a*silu(b).
         self.c_fc   = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.use_bias)
         self.act    = SwiGLU()
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.use_bias)
@@ -119,12 +122,12 @@ class MLP(nn.Module):
 
 class CausalSelfAttention(nn.Module):
     """
-    A 'modern' GPT style attention with multi-query or grouped-query.
+    A 'modern' GPT-style attention with optional multi-query or standard MHA:
     - n_head (Q heads)
     - n_kv_head (K/V heads)
-    - same per-head dimension for Q, K, V => replicate K,V if needed.
-    - optional RoPE
-    - uses PyTorch 2.0 scaled_dot_product_attention (flash)
+    - Fused Q,K,V in a single linear (c_qkv).
+    - If n_kv_head == n_head, we do normal multi-head attention (no replication).
+    - Otherwise, if n_kv_head < n_head, replicate K, V to match n_head.
     """
 
     def __init__(self, config: ModernGPTConfig):
@@ -134,19 +137,20 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0, "n_embd must be divisible by n_head"
         self.head_dim = config.n_embd // config.n_head
 
+        # total = Q + K + V
         # Q dimension = n_head_q * head_dim
-        q_out_dim = self.n_head_q * self.head_dim
-        # KV dimension = n_kv_head * head_dim
-        kv_out_dim = self.n_kv_head * self.head_dim
+        # K dimension = n_kv_head * head_dim
+        # V dimension = n_kv_head * head_dim
+        # => total_out_dim = (n_head_q + 2*n_kv_head)*head_dim
+        total_out_dim = (self.n_head_q + 2 * self.n_kv_head) * self.head_dim
 
-        self.W_q = nn.Linear(config.n_embd, q_out_dim, bias=config.use_bias)
-        self.W_k = nn.Linear(config.n_embd, kv_out_dim, bias=config.use_bias)
-        self.W_v = nn.Linear(config.n_embd, kv_out_dim, bias=config.use_bias)
+        # single fused linear for Q, K, V
+        self.c_qkv = nn.Linear(config.n_embd, total_out_dim, bias=config.use_bias)
 
         self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.use_bias)
         self.resid_drop = nn.Dropout(config.dropout)
 
-        # scale
+        # scale factor for Q
         self.scale_attn = 1.0 / math.sqrt(self.head_dim)
 
     def forward(self, x, rope_cache=None):
@@ -156,22 +160,23 @@ class CausalSelfAttention(nn.Module):
         """
         B, T, C = x.shape
 
-        # Q => shape (B, T, n_head_q*head_dim) => (B, n_head_q, T, head_dim)
-        q = self.W_q(x)
-        q = q.view(B, T, self.n_head_q, self.head_dim).transpose(1, 2)  # => [B, n_head_q, T, head_dim]
+        # Fused Q,K,V in one matmul
+        qkv = self.c_qkv(x)  # (B, T, total_out_dim)
 
-        # K => shape (B, T, n_kv_head*head_dim) => (B, n_kv_head, T, head_dim)
-        k = self.W_k(x)
-        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        # chunk out Q, K, V
+        q_out_dim = self.n_head_q * self.head_dim
+        kv_out_dim = self.n_kv_head * self.head_dim
+        q, k, v = torch.split(qkv, [q_out_dim, kv_out_dim, kv_out_dim], dim=-1)
 
-        # V => shape (B, T, n_kv_head*head_dim) => (B, n_kv_head, T, head_dim)
-        v = self.W_v(x)
-        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        # reshape => [B, #heads, T, head_dim]
+        q = q.view(B, T, self.n_head_q, self.head_dim).transpose(1, 2)  # [B, n_head_q, T, head_dim]
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # [B, n_kv_head, T, head_dim]
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # [B, n_kv_head, T, head_dim]
 
-        # replicate K, V if n_kv_head < n_head_q
+        # If n_kv_head == n_head_q, we have standard MHA => no replication needed
+        # Otherwise, if n_kv_head < n_head_q, replicate K, V
         if self.n_kv_head < self.n_head_q:
             repeat_factor = self.n_head_q // self.n_kv_head
-            # (B, n_kv_head, T, head_dim) => expand => (B, n_kv_head, repeat_factor, T, head_dim)
             k = k.unsqueeze(2).expand(-1, -1, repeat_factor, -1, -1)
             k = k.reshape(B, self.n_head_q, T, self.head_dim)
             v = v.unsqueeze(2).expand(-1, -1, repeat_factor, -1, -1)
@@ -179,14 +184,12 @@ class CausalSelfAttention(nn.Module):
 
         # optional RoPE
         if rope_cache is not None:
-            # rope_cache => [max_seq, head_dim], use up to T
             q = apply_rope(q, rope_cache[:T])
             k = apply_rope(k, rope_cache[:T])
 
         q = q * self.scale_attn
 
-        # scaled dot product attention (flash possible)
-        # => (B, n_head_q, T, head_dim)
+        # scaled dot-product attention (Flash if supported by your GPU / PyTorch)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # reassemble => [B, T, n_embd]
@@ -214,7 +217,7 @@ class Block(nn.Module):
         return x
 
 ################################################################
-# ModernGPT
+# ModernGPT (with optimized MHA path)
 ################################################################
 
 class ModernGPT(nn.Module):
@@ -222,7 +225,8 @@ class ModernGPT(nn.Module):
     GPT-like model with:
     - RMSNorm
     - RoPE (no separate wpe)
-    - Multi-Query (n_kv_head < n_head)
+    - Multi-Query or standard MHA depending on n_kv_head
+    - Fused Q,K,V linear
     - SwiGLU MLP
     - Tied embeddings
     """
@@ -232,7 +236,6 @@ class ModernGPT(nn.Module):
         self.config = config
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        # no wpe
 
         self.h = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = RMSNorm(config.n_embd)
@@ -249,7 +252,7 @@ class ModernGPT(nn.Module):
         self.register_buffer("rope_cache", rope, persistent=False)
 
         n_params = sum(p.numel() for p in self.parameters())
-        print(f"[ModernGPT] inited with {n_params/1e6:.2f} M params. n_kv_head={config.n_kv_head}")
+        print(f"[ModernGPT] inited with {n_params/1e6:.2f} M params. n_head={config.n_head}, n_kv_head={config.n_kv_head}")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear) or isinstance(module, nn.Embedding):
@@ -266,10 +269,9 @@ class ModernGPT(nn.Module):
         B, T = idx.shape
         assert T <= self.config.block_size, "Sequence too long."
 
-        # token embeddings
-        x = self.wte(idx)
+        x = self.wte(idx)  # token embeddings
 
-        # pass each block
+        # pass each transformer block
         for block in self.h:
             x = block(x, rope_cache=self.rope_cache)
 
@@ -278,9 +280,11 @@ class ModernGPT(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                   targets.view(-1),
-                                   ignore_index=-1)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1
+            )
 
         return logits, loss
 

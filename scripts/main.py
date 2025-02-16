@@ -79,7 +79,7 @@ def main():
             vocab_size=50257,
             n_layer=12,
             n_head=12,
-            n_kv_head=2,  # Multi-Query
+            #n_kv_head=1,  # Multi-Query # leave default
             n_embd=768,
             dropout=0.0
         )
