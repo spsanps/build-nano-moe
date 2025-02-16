@@ -3,10 +3,8 @@ import torch
 from torch.distributed import init_process_group
 import argparse
 
-import torch._dynamo
-torch._dynamo.config.suppress_errors = True
-
 from train import train
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -23,37 +21,36 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default="test-gpt-run")
     parser.add_argument("--do_hellaswag", action='store_true', default=False)
     
-    # NEW: pick GPT vs. nGPT
+    # pick GPT, nGPT or modernGPT
     parser.add_argument("--model_type", type=str, default="gpt",
-                        choices=["gpt", "ngpt"],
-                        help="Which model class to use: 'gpt' or 'ngpt'")
+                        choices=["gpt", "ngpt", "moderngpt"],
+                        help="Which model class to use.")
     
     return parser.parse_args()
 
 def main():
-    # Check if we are launched with torchrun for DDP
     ddp = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
     if ddp:
         init_process_group(backend='nccl')
     
     args = parse_args()
 
-    # If user picks nGPT, optionally set some defaults
-    # (only if the user hasn't changed them)
+    # If user picks nGPT or modernGPT, override certain defaults:
     if args.model_type == "ngpt":
-        # nGPT might train fine with a slightly lower LR or the same. Adjust as you see fit:
         if args.max_lr == 6e-4:
             args.max_lr = 15e-4
         if args.run_name == "test-gpt-run":
             args.run_name = "my-nGPT-run"
+    elif args.model_type == "moderngpt":
+        # slightly different defaults for a "modern GPT" 
+        if args.max_lr == 6e-4:
+            pass
+            #args.max_lr = 3e-4
+        if args.run_name == "test-gpt-run":
+            args.run_name = "my-modernGPT-run"
 
-    # call training
-    # Instead of creating GPT or nGPT here, we rely on the `train(...)` function
-    # which creates a GPTConfig / GPT or nGPTConfig / nGPT. We can do it there,
-    # or we can do it here. Let's do it here for clarity.
-
+    # Build the model
     if args.model_type == "gpt":
-        # original
         from GPT import GPT, GPTConfig
         config = GPTConfig(
             block_size=args.T,
@@ -63,8 +60,8 @@ def main():
             n_embd=768
         )
         model = GPT(config)
-    else:
-        # nGPT
+
+    elif args.model_type == "ngpt":
         from nGPT import nGPT, nGPTConfig
         config = nGPTConfig(
             block_size=args.T,
@@ -72,21 +69,28 @@ def main():
             n_layer=12,
             n_head=12,
             n_embd=768
-            # you can also pass dropout=0.0, etc. 
         )
         model = nGPT(config)
-        
-    model = model.to(args.device_type)
-    # compile model and optimizer setup
+
+    else:  # moderngpt
+        from modernGPT import ModernGPT, ModernGPTConfig
+        config = ModernGPTConfig(
+            block_size=args.T,
+            vocab_size=50257,
+            n_layer=12,
+            n_head=12,
+            n_kv_head=2,  # Multi-Query
+            n_embd=768,
+            dropout=0.0
+        )
+        model = ModernGPT(config)
+
+    model.to(args.device_type)
+    
+    # compile model
+    
     model = torch.compile(model)
 
-    # Now pass the model directly to train(...). 
-    # We just need to match the signature that train.py expects:
-    # train(...) typically does something like:
-    #   model.to(device)
-    #   optimizer = model.configure_optimizers(...)
-    #   ...
-    
     train(
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
@@ -99,11 +103,8 @@ def main():
         log_dir=args.log_dir,
         run_name=args.run_name,
         do_hellaswag=args.do_hellaswag,
-        sample_model=False,  # or True, up to you
-        # Provide the model as a direct argument. 
-        # If your train.py is set up to create the model itself, 
-        # you can adapt it to optionally accept an external model.
-        model=model
+        sample_model=False,
+        model=model  # pass directly to train(...)
     )
 
 if __name__ == "__main__":
