@@ -3,6 +3,9 @@ import torch
 from torch.distributed import init_process_group
 import argparse
 
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 from train import train
 
 def parse_args():
@@ -74,6 +77,8 @@ def main():
         model = nGPT(config)
         
     model = model.to(args.device_type)
+    # compile model and optimizer setup
+    model = torch.compile(model)
 
     # Now pass the model directly to train(...). 
     # We just need to match the signature that train.py expects:

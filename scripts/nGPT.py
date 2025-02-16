@@ -1,3 +1,6 @@
+# nGPT.py
+# based on https://github.com/NVIDIA/ngpt
+
 import math
 import torch
 import torch.nn as nn
@@ -165,14 +168,8 @@ class nGPTBlock(nn.Module):
         q = justnorm(q, dim=-1) * sqk_val.view(1, 1, 1, -1)[..., :head_dim]
         k = justnorm(k, dim=-1) * sqk_val.view(1, 1, 1, -1)[..., :head_dim]
 
-        # scaled dot attention (using PyTorch 2.0+ built-in)
-        # We'll do an approximate scale. Typically 1/sqrt(head_dim).
-        # But with nGPT we do a variant. Let’s keep it simple:
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=0.0,
-            is_causal=True
-        )  # shape [B, n_head, T, head_dim]
+        # scaled dot-product attention (flash attention if available)
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # shape [B, n_head, T, head_dim]
 
         # Recombine heads
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
