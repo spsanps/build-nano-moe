@@ -7,6 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+###############################################################################
+# Configuration
+###############################################################################
+
 @dataclass
 class nGPTConfig:
     # Basic GPT-like configuration
@@ -17,10 +21,10 @@ class nGPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     # nGPT-specific scaling: Typically ~1 / sqrt(n_embd)
-    base_scale: float = 1.0 / math.sqrt(768.0)  
+    base_scale: float = 1.0 / math.sqrt(768.0)
 
 ###############################################################################
-# Helper classes/functions
+# RMSNorm
 ###############################################################################
 
 class RMSNorm(nn.Module):
@@ -38,8 +42,12 @@ class RMSNorm(nn.Module):
         x = x * torch.rsqrt(norm + self.eps)
         return self.weight * x
 
+###############################################################################
+# Rotary Embeddings & Helpers
+###############################################################################
+
 def get_sinusoidal_embeddings(n_positions: int, dim: int, device=None):
-    """Generate standard sinusoidal [sin, cos] position embeddings."""
+    """Generate standard [sin, cos] position embeddings (one per position)."""
     if device is None:
         device = torch.device("cpu")
     position = torch.arange(n_positions, dtype=torch.float, device=device).unsqueeze(1)
@@ -51,26 +59,17 @@ def get_sinusoidal_embeddings(n_positions: int, dim: int, device=None):
 
 def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
     """
-    Apply rotary embeddings to q, k in-place.
-    This expects sinusoidal_pos to be shape [T, head_dim], and q,k to be shape:
-      [batch_size, n_heads, seq_len, head_dim].
+    Apply rotary embeddings in-place to q, k.
+    sinusoidal_pos: [T, head_dim]
+    q,k: [B, n_head, T, head_dim]
     """
-    # Expand sinusoidal to [1, 1, T, head_dim]
-    # but since we do a broadcast, let's do it carefully:
     sincos = sinusoidal_pos.unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
-    # split into sin and cos
-    sin, cos = sincos.chunk(2, dim=-1)  # each shape (1,1,T, head_dim/2)
+    sin, cos = sincos.chunk(2, dim=-1)
 
-    # for the queries:
-    # x[..., ::2], x[..., 1::2] pattern
-    # we'll do a direct rearrangement
     def rotary(x):
-        # x has shape [b, nH, T, head_dim]
         x0 = x[..., 0::2]
         x1 = x[..., 1::2]
-        # new 0::2 = x0 * cos - x1 * sin
-        # new 1::2 = x1 * cos + x0 * sin
-        return torch.cat([x0*cos - x1*sin, x1*cos + x0*sin], dim=-1)
+        return torch.cat([x0 * cos - x1 * sin, x1 * cos + x0 * sin], dim=-1)
 
     q_out = rotary(q)
     k_out = rotary(k)
@@ -83,7 +82,7 @@ def justnorm(x, dim=-1, eps=1e-8):
     return x / (x.norm(p=2, dim=dim, keepdim=True) + eps)
 
 ###############################################################################
-# Transformer Block (nGPT style)
+# nGPTBlock
 ###############################################################################
 
 class nGPTBlock(nn.Module):
@@ -96,20 +95,26 @@ class nGPTBlock(nn.Module):
        - attn_alpha, mlp_alpha, sqk, suv
     """
 
-    def __init__(self, config):
+    def __init__(self, config: nGPTConfig):
         super().__init__()
         self.n_embd = config.n_embd
         self.n_head = config.n_head
         head_dim = config.n_embd // config.n_head
 
-        # Linear transforms for Q, K, V
-        self.key   = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.query = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.value = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        # ---------------------------------------------------------------------
+        # Fused Q,K,V projection: all in one linear for performance
+        # ---------------------------------------------------------------------
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+
+        # Output projection after attention
         self.attn_out = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
-        # MLP
-        self.fc = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=False)
+        # ---------------------------------------------------------------------
+        # Fused MLP input projection
+        # We feed x into a single W matrix that produces the "u,v" pairs
+        # shape = 2 * 4 * n_embd = 8 * n_embd (same as before).
+        # ---------------------------------------------------------------------
+        self.c_mlp = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=False)
         self.mlp_out = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.act = nn.SiLU()
 
@@ -118,8 +123,6 @@ class nGPTBlock(nn.Module):
         self.rms_mlp = RMSNorm(config.n_embd)
 
         # nGPT gating parameters
-        # (They are scaled versions of alpha gating in the paper.)
-        # We'll store them in float32 for safety, then cast as needed
         self.register_parameter(
             "attn_alpha",
             nn.Parameter(torch.ones(config.n_embd, dtype=torch.float32) * (0.05 * config.base_scale))
@@ -139,20 +142,23 @@ class nGPTBlock(nn.Module):
 
     def forward(self, x, sinusoidal_cache=None):
         """
-        x: (batch, seq_len, n_embd)
-        sinusoidal_cache: precomputed sin/cos for rotary (seq_len, head_dim)
+        x: (B, T, C)
+        sinusoidal_cache: precomputed sin/cos for rotary (T, head_dim)
         """
         B, T, C = x.size()
+
+        # ---------------------------------------------------------------------
         # 1) Self-Attention
-        # Norm
-        x_attn_input = self.rms_att(x)     # (B, T, C)
-        q = self.query(x_attn_input)
-        k = self.key(x_attn_input)
-        v = self.value(x_attn_input)
+        # ---------------------------------------------------------------------
+        x_attn_input = self.rms_att(x)      # (B, T, C)
+
+        # Fused linear to get Q,K,V
+        qkv = self.c_attn(x_attn_input)     # (B, T, 3*C)
+        q, k, v = qkv.split(C, dim=-1)      # each (B, T, C)
 
         # Reshape into [B, n_head, T, head_dim]
         head_dim = C // self.n_head
-        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)  # (B,nH,T,hd)
         k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
 
@@ -160,43 +166,38 @@ class nGPTBlock(nn.Module):
         if sinusoidal_cache is not None:
             q, k = apply_rotary_position_embeddings(sinusoidal_cache, q, k)
 
-        # scale q, k by sqk gating (n_embd float -> shape or broadcast)
-        # Typically we interpret sqk as shape [n_embd], but we can broadcast
-        # across heads/time. We'll do an approach that normalizes q, k:
+        # scale q, k by sqk gating
         sqk_val = self.sqk * (1.0 / max(self.sqk.abs().max(), 1e-6))
-        # direct approach: L2-normalize q, k, then multiply by some factor
         q = justnorm(q, dim=-1) * sqk_val.view(1, 1, 1, -1)[..., :head_dim]
         k = justnorm(k, dim=-1) * sqk_val.view(1, 1, 1, -1)[..., :head_dim]
 
-        # scaled dot-product attention (flash attention if available)
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # shape [B, n_head, T, head_dim]
-
-        # Recombine heads
+        # scaled dot-product attention (Flash if PyTorch >= 2.0 + GPU is suitable)
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
 
         # final projection
         attn_out = self.attn_out(attn_out)
 
         # alpha gating for residual
-        # we L2-normalize the original x, and also L2-normalize attn_out
-        # then alpha-blend them
         alpha_attn = self.attn_alpha
-        alpha_attn = alpha_attn * (0.05 / max(alpha_attn.abs().max(), 1e-6))  # stable re-scale
+        alpha_attn = alpha_attn * (0.05 / max(alpha_attn.abs().max(), 1e-6))
         x_norm = justnorm(x, dim=-1)
         y_norm = justnorm(attn_out, dim=-1)
-        # simple version: x + alpha*(y - x) => x + alpha*y - alpha*x => (1-alpha)*x + alpha*y
+        # h_att = x + alpha*(y - x)
         h_att = x_norm + alpha_attn * (y_norm - x_norm)
 
+        # ---------------------------------------------------------------------
         # 2) MLP
+        # ---------------------------------------------------------------------
         x_mlp_in = self.rms_mlp(h_att)
-        uv = self.fc(x_mlp_in)  # shape [B, T, 8*n_embd]
+        uv = self.c_mlp(x_mlp_in)  # shape [B, T, 8*C] (since 2*4*C = 8*C)
+
         # apply gating to uv
-        # We'll interpret suv similarly to sqk
         suv_val = self.suv * (1.0 / max(self.suv.abs().max(), 1e-6))
         uv = uv * suv_val.view(1, 1, -1)  # broadcast on B,T
 
-        # u, v halves
-        u, v = torch.chunk(uv, 2, dim=-1)
+        # split into u,v
+        u, v = torch.chunk(uv, 2, dim=-1)  # each is [B, T, 4*C]
         mlp_intermediate = u * self.act(v)
 
         # project back
@@ -208,7 +209,7 @@ class nGPTBlock(nn.Module):
         y_norm2 = justnorm(mlp_out, dim=-1)
         h_mlp = h_att + alpha_mlp * (y_norm2 - h_att)
 
-        # L2-normalize final (sometimes done, but you can skip if you want)
+        # Final L2-normalize (optional)
         h_final = justnorm(h_mlp, dim=-1)
         return h_final
 
@@ -218,9 +219,9 @@ class nGPTBlock(nn.Module):
 
 class nGPT(nn.Module):
     """
-    A GPT-like language model with nGPT gating & RMS norms.
-    This has the same signature as the original GPT, so it can be used
-    interchangeably in train.py or main.py.
+    A GPT-like language model with nGPT gating & RMS norms,
+    now using a fused Q,K,V linear and fused MLP input projection
+    to reduce GPU kernel launches and improve performance.
     """
 
     def __init__(self, config: nGPTConfig):
@@ -229,16 +230,13 @@ class nGPT(nn.Module):
 
         # token embedding
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+
         # block modules
         self.blocks = nn.ModuleList([nGPTBlock(config) for _ in range(config.n_layer)])
+
         # final linear decoder
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
-
-        # We do NOT tie embeddings in the nGPT paper references 
-        # however for better parameter efficiency we do it here
-        
-        self.lm_head.weight = self.wte.weight
+        self.lm_head.weight = self.wte.weight  # tie weights
 
         # build a reusable sinusoidal table for rotary embedding up to config.block_size
         head_dim = config.n_embd // config.n_head
@@ -280,8 +278,8 @@ class nGPT(nn.Module):
 
         # forward the GPT model
         token_emb = self.wte(idx)  # (B, T, n_embd)
-
         x = token_emb
+
         # pass through each Transformer block
         for block in self.blocks:
             x = block(x, sinusoidal_cache=self.sinusoidal_cache[:T])
@@ -314,7 +312,7 @@ class nGPT(nn.Module):
             print(f"[nGPT] num decayed params: {sum(p.numel() for p in decay_params):,}")
             print(f"[nGPT] num non-decayed params: {sum(p.numel() for p in nodecay_params):,}")
 
-        # (optional) fused AdamW
+        # (optional) fused AdamW if available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == "cuda"
         if master_process:
