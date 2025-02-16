@@ -10,7 +10,7 @@ from torch.distributed import init_process_group, destroy_process_group
 import wandb
 
 from data import DataLoaderLite, iterate_examples, get_most_likely_row
-from nGPT import GPT, GPTConfig
+from GPT import GPT, GPTConfig
 from utils import get_lr
 
 def train(
@@ -26,9 +26,23 @@ def train(
     log_dir='log',
     project_name='my-gpt-project',
     run_name='my-ngpt-run',
-    do_hellaswag=True,
+    do_hellaswag=False,
     sample_model=False,
+    model=None
 ):
+    
+    if model is None:
+        # default GPT approach
+        raise ValueError("No external model provided. Please provide a model to train.")
+        config = GPTConfig()
+        model = GPT(config)
+    else:
+        # use the model we passed from main.py
+        model = model
+        config = model.config
+        
+    # device = model.device
+    
     """
     Main training loop.
     """
@@ -64,9 +78,9 @@ def train(
     val_loader   = DataLoaderLite(B, T, ddp_rank, ddp_world_size, split="val",   data_root=data_root)
 
     # create model
-    config = GPTConfig()  # example config
-    model = GPT(config)
-    model.to(device)
+    # config = GPTConfig()  # example config
+    # model = GPT(config)
+    # model.to(device)
     raw_model = model  # for logging or checkpoint saving
 
     if ddp:
@@ -123,6 +137,7 @@ def train(
 
         # --- Evaluate HellaSwag (if desired and not compiled)
         if do_hellaswag and (step % 250 == 0 or last_step):
+            raise ValueError("HellaSwag implementation is not evaluated yet.")
             num_correct_norm = 0
             num_total = 0
             if master_process:
