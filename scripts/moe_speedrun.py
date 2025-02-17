@@ -27,7 +27,7 @@ class MoeGPTConfig:
     n_head: int = 8
     n_embd: int = 512
     dropout: float = 0.0
-    use_bias: bool = True
+    use_bias: bool = False  # Changed default to False
 
     # Rope scaling (for rotary embeddings)
     rope_scaling: float = 10000.0
@@ -142,10 +142,11 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
 
-        # single fused Q,K,V => out_dim = 3 * n_embd
-        self.c_qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.use_bias)
-
-        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.use_bias)
+        # Remove bias from all linear layers
+        self.c_qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        # Initialize output projection to zero
+        nn.init.zeros_(self.out_proj.weight)
         self.resid_drop = nn.Dropout(config.dropout)
 
     def forward(self, x, rope_cache=None):
@@ -188,8 +189,11 @@ class Expert(nn.Module):
     def __init__(self, config: MoeGPTConfig):
         super().__init__()
         hidden_dim = config.ffn_factor * config.n_embd
-        self.fc = nn.Linear(config.n_embd, hidden_dim, bias=config.use_bias)
-        self.proj = nn.Linear(hidden_dim, config.n_embd, bias=config.use_bias)
+        # Remove bias from both layers
+        self.fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        # Initialize output projection to zero
+        nn.init.zeros_(self.proj.weight)
         self.drop = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -375,25 +379,19 @@ class MoEMLPParallel(nn.Module):
         self.hidden_dim = config.ffn_factor * config.n_embd
 
         # gating linear => (n_embd -> n_total_experts)
-        self.gate_linear = nn.Linear(self.dim, self.n_total_experts, bias=True)
+        self.gate_linear = nn.Linear(self.dim, self.n_total_experts, bias=False)
 
         # Single large parameter set:
         #   fc_weight   => (n_experts, hidden_dim, n_embd)
-        #   fc_bias     => (n_experts, hidden_dim)
         #   proj_weight => (n_experts, n_embd, hidden_dim)
-        #   proj_bias   => (n_experts, n_embd)
         self.fc_weight    = nn.Parameter(torch.zeros(self.n_total_experts, self.hidden_dim, self.dim))
-        self.fc_bias      = nn.Parameter(torch.zeros(self.n_total_experts, self.hidden_dim))
         self.proj_weight  = nn.Parameter(torch.zeros(self.n_total_experts, self.dim, self.hidden_dim))
-        self.proj_bias    = nn.Parameter(torch.zeros(self.n_total_experts, self.dim))
 
         self.drop = nn.Dropout(config.dropout)
 
         # init
         nn.init.normal_(self.fc_weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.fc_bias)
-        nn.init.normal_(self.proj_weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.proj_bias)
+        nn.init.zeros_(self.proj_weight)  # Initialize output projection to zero
 
     def forward(self, x):
         """
@@ -441,14 +439,12 @@ class MoEMLPParallel(nn.Module):
         # 4) big parallel forward for all experts
         # fc_out => (N,e,h)
         fc_out = torch.einsum('nd,ehd->neh', xflat, self.fc_weight)
-        fc_out = fc_out + self.fc_bias.unsqueeze(0)  # broadcast bias
         
         # activation
         hidden = F.relu(fc_out).square()  # => (N,e,h)
 
         # out_experts => (N,e,c)
         out_experts = torch.einsum('neh,edh->ned', hidden, self.proj_weight)
-        out_experts = out_experts + self.proj_bias.unsqueeze(0)
         out_experts = self.drop(out_experts)
 
         # Weighted sum => gating => shape(N,e)
