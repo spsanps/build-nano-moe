@@ -102,19 +102,17 @@ class SwiGLU(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: ModernGPTConfig):
         super().__init__()
-        hidden_dim = config.ffn_factor * config.n_embd  # e.g. 2 * n_embd
-        # We'll do c_fc => (n_embd -> 2*hidden_dim). Then split => a|b => a*silu(b).
-        self.c_fc   = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.use_bias)
-        self.act    = SwiGLU()
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.use_bias)
-        self.drop   = nn.Dropout(config.dropout)
+        self.hidden_size = config.n_embd
+        self.intermediate_size = config.ffn_factor * config.n_embd
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.use_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.use_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
+        self.act_fn = F.silu
+        self.drop = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.act(x)
-        x = self.c_proj(x)
-        x = self.drop(x)
-        return x
+        out = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.drop(out)
 
 ################################################################
 # CausalSelfAttention

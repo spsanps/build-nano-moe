@@ -1,4 +1,5 @@
-# model.py
+# GPT.py
+# based on https://github.com/karpathy/build-nanogpt
 
 import math
 import torch
