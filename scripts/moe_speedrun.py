@@ -633,18 +633,24 @@ class MoeGPT(nn.Module):
     def configure_optimizers(self, weight_decay, learning_rate, device_type, master_process=True):
         """
         Returns an AdamW optimizer with optional fused variant (PyTorch 2.0+ on GPU).
-        Typically used in a training loop external to this file.
+        Embedding layer gets 2x learning rate.
         """
         import inspect
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        
+        # Separate embeddings for 2x learning rate
+        emb_params = [p for n, p in param_dict.items() if 'wte' in n]  # embeddings
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2 and 'wte' not in n]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-
+        
         optim_groups = [
+            {'params': emb_params, 'weight_decay': 0.0, 'lr': 2 * learning_rate},  # 2x lr for embeddings
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
+        
         if master_process:
+            print(f"[MoeGPT] embedding params (2x lr): {sum(p.numel() for p in emb_params):,}")
             print(f"[MoeGPT] decayed params: {sum(p.numel() for p in decay_params):,}")
             print(f"[MoeGPT] no-decay params: {sum(p.numel() for p in nodecay_params):,}")
 
