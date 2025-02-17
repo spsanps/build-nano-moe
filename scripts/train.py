@@ -13,6 +13,8 @@ from data import DataLoaderLite, iterate_examples, get_most_likely_row
 from GPT import GPT, GPTConfig
 from utils import get_lr
 
+torch._dynamo.config.capture_scalar_outputs = True
+
 def train(
     max_steps=2000,
     warmup_steps=200,
