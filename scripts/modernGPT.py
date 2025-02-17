@@ -20,6 +20,7 @@ class ModernGPTConfig:
     use_bias: bool = True
     rope_scaling: float = 10000.0  # base factor for rotary embeddings
     ffn_factor: int = 2           # expansion factor for MLP (SwiGLU etc.)
+    use_gate_proj: bool = False  # whether to use gated MLP or swiGlU MLP
 
 ################################################################
 # RoPE utilities
@@ -100,6 +101,27 @@ class SwiGLU(nn.Module):
 ################################################################
 
 class MLP(nn.Module):
+    def __init__(self, config: ModernGPTConfig):
+        super().__init__()
+        hidden_dim = config.ffn_factor * config.n_embd  # e.g. 2 * n_embd
+        # We'll do c_fc => (n_embd -> 2*hidden_dim). Then split => a|b => a*silu(b).
+        self.c_fc   = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.use_bias)
+        self.act    = SwiGLU()
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.use_bias)
+        self.drop   = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
+        x = self.drop(x)
+        return x
+
+################################################################
+# GatedMLP
+################################################################
+
+class GatedMLP(nn.Module):
     def __init__(self, config: ModernGPTConfig):
         super().__init__()
         self.hidden_size = config.n_embd
@@ -207,7 +229,7 @@ class Block(nn.Module):
         self.ln1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln2 = RMSNorm(config.n_embd)
-        self.mlp = MLP(config)
+        self.mlp = GatedMLP(config) if config.use_gate_proj else MLP(config)
 
     def forward(self, x, rope_cache=None):
         x = x + self.attn(self.ln1(x), rope_cache=rope_cache)

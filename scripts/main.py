@@ -20,6 +20,8 @@ def parse_args():
     parser.add_argument("--log_dir", type=str, default="log")
     parser.add_argument("--run_name", type=str, default="test-gpt-run")
     parser.add_argument("--do_hellaswag", action='store_true', default=False)
+    # let's set a default True override for default selection based on model type
+    parser.add_argument("--no_override_defaults", action='store_true', default=False)
     
     # pick GPT, nGPT or modernGPT
     parser.add_argument("--model_type", type=str, default="gpt",
@@ -36,18 +38,18 @@ def main():
     args = parse_args()
 
     # If user picks nGPT or modernGPT, override certain defaults:
-    if args.model_type == "ngpt":
-        if args.max_lr == 6e-4:
-            args.max_lr = 15e-4
-        if args.run_name == "test-gpt-run":
-            args.run_name = "my-nGPT-run"
-    elif args.model_type == "moderngpt":
-        # slightly different defaults for a "modern GPT" 
-        if args.max_lr == 6e-4:
-            pass
-            #args.max_lr = 3e-4
-        if args.run_name == "test-gpt-run":
-            args.run_name = "my-modernGPT-run"
+    if not args.no_override_defaults:
+        if args.model_type == "ngpt":
+            if args.max_lr == 6e-4:
+                args.max_lr = 15e-4
+            if args.run_name == "test-gpt-run":
+                args.run_name = "my-nGPT-run"
+        elif args.model_type == "moderngpt":
+            # slightly different defaults for a "modern GPT" 
+            if args.max_lr == 6e-4:
+                args.max_lr = 1e-3 # small model - we have clipping as well
+            if args.run_name == "test-gpt-run":
+                args.run_name = "my-modernGPT-run"
 
     # Build the model
     if args.model_type == "gpt":
