@@ -142,6 +142,10 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
 
+        # Add RMSNorm for Q,K
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
         # Remove bias from all linear layers
         self.c_qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
@@ -167,6 +171,10 @@ class CausalSelfAttention(nn.Module):
         if rope_cache is not None:
             q = apply_rope(q, rope_cache[:T])
             k = apply_rope(k, rope_cache[:T])
+
+        # Apply RMSNorm to Q,K
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # scaled dot-product attention (is_causal=True)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
