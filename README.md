@@ -6,6 +6,9 @@ Defaults are set to work well on a Nvidia 4090 GPU (24GB VRAM with bf16 support)
 
 Built with the help of o1-pro. 
 
+![Sample MoE Training Loss](assets/sample_loss_moe_68M_edufineweb.png)
+*Sample training loss for a 68M parameter MoE model on the edufineweb dataset*
+
 ## Overview
 
 This repository contains multiple GPT implementations to demonstrate different architectures and optimizations:
@@ -24,7 +27,7 @@ This repository contains multiple GPT implementations to demonstrate different a
 
 ## Usage
 
-Train a model for 1000 steps:
+Train a model on the edufineweb dataset for 1000 steps:
 
 ```bash
 python main.py --model_type [gpt|moderngpt|moegpt] --max_steps 1000 --warmup_steps 100
