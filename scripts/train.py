@@ -26,7 +26,7 @@ def train(
     device_type='cuda',
     data_root='../data/edu_fineweb10B',
     log_dir='log',
-    project_name='my-gpt-project',
+    project_name='full-gpt-run',
     run_name='my-ngpt-run',
     do_hellaswag=False,
     sample_model=False,

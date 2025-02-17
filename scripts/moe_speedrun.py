@@ -23,7 +23,7 @@ class MoeGPTConfig:
     vocab_size: int = 50304
 
     # Transformer architecture
-    n_layer: int = 12
+    n_layer: int = 8
     n_head: int = 8
     n_embd: int = 512
     dropout: float = 0.0
@@ -33,7 +33,7 @@ class MoeGPTConfig:
     rope_scaling: float = 10000.0
 
     # MoE hyperparams
-    n_experts: int = 8          # total "macro-experts"
+    n_experts: int = 4          # total "macro-experts"
     m_sub_experts: int = 1      # sub-experts per macro => total = n_experts*m_sub_experts
     n_shared_experts: int = 1    # how many "macro" experts are always active
     n_activated_experts: int = 2 # top-k gating among the rest
