@@ -190,6 +190,8 @@ class MoEMLP(nn.Module):
 
         # gating => (N, n_total_experts)
         logits = self.gate_linear(xflat)
+        # Store raw gating scores (before Top-K or Softmax)
+        raw_scores_sum = logits.sum(dim=0)
         if self.score_func == "softmax":
             scores = F.softmax(logits, dim=-1, dtype=torch.float32).to(logits.dtype)
         else:  # "sigmoid"
@@ -213,7 +215,6 @@ class MoEMLP(nn.Module):
 
         # track usage & sums
         usage_count = torch.zeros(self.n_total_experts, dtype=torch.long, device=x.device)
-        score_sum   = torch.zeros(self.n_total_experts, dtype=scores.dtype, device=x.device)
 
         # Flatten them
         row_ids  = torch.arange(N, device=x.device).unsqueeze(-1).expand(N, self.n_shared + self.k).reshape(-1)
@@ -253,7 +254,6 @@ class MoEMLP(nn.Module):
 
             # usage
             usage_count[e_id] += (end_i - start_i)
-            score_sum[e_id]   += chunk_w.sum()
 
         # unsort back
         inv_sort = torch.empty_like(sort_idx)
@@ -274,7 +274,7 @@ class MoEMLP(nn.Module):
         n_ex = float(self.n_total_experts)
         Kp = float(self.n_shared + self.k)
         usage_f = (n_ex / (Kp*N)) * usage_count.float()
-        score_p = (1.0 / N) * score_sum
+        score_p = (1.0 / N) * raw_scores_sum
         bal_loss = (usage_f * score_p).sum()
 
         return out, bal_loss
