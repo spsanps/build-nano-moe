@@ -84,7 +84,7 @@ def main():
         model = nGPT(config)
         
     elif args.model_type == "moegpt":
-        from moe import MoeGPT, MoeGPTConfig
+        from moe_speedrun import MoeGPT, MoeGPTConfig
         config = MoeGPTConfig(
             # use defaults for now
         )
