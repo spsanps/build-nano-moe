@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import torch
 from torch.distributed import init_process_group
@@ -25,7 +27,7 @@ def parse_args():
     
     # pick GPT, nGPT or modernGPT
     parser.add_argument("--model_type", type=str, default="gpt",
-                        choices=["gpt", "ngpt", "moderngpt"],
+                        choices=["gpt", "ngpt", "moderngpt", "moegpt"],
                         help="Which model class to use.")
     
     return parser.parse_args()
@@ -44,12 +46,19 @@ def main():
                 args.max_lr = 15e-4
             if args.run_name == "test-gpt-run":
                 args.run_name = "my-nGPT-run"
-        elif args.model_type == "moderngpt":
+        if args.model_type == "moderngpt":
             # slightly different defaults for a "modern GPT" 
             if args.max_lr == 6e-4:
                 args.max_lr = 1e-3 # small model - we have clipping as well
             if args.run_name == "test-gpt-run":
                 args.run_name = "my-modernGPT-run"
+        
+        if args.model_type == "moegpt":
+            if args.max_lr == 6e-4:
+                args.max_lr = 8e-4  # example: bigger LR for MoE
+            if args.run_name == "test-gpt-run":
+                args.run_name = "my-MoeGPT-run"
+                
 
     # Build the model
     if args.model_type == "gpt":
@@ -73,6 +82,13 @@ def main():
             n_embd=768
         )
         model = nGPT(config)
+        
+    elif args.model_type == "moegpt":
+        from moe import MoeGPT, MoeGPTConfig
+        config = MoeGPTConfig(
+            # use defaults for now
+        )
+        model = MoeGPT(config)
 
     else:  # moderngpt
         from modernGPT import ModernGPT, ModernGPTConfig
