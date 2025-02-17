@@ -125,8 +125,9 @@ def train(
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(x, y)
-                    val_loss_accum += loss.detach().float()
+                        logits, losses = model(x, y)
+                        # always use 'loss' for accumulation
+                        val_loss_accum += losses['loss'].detach().float()
             if ddp:
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.SUM)
                 val_loss_accum = val_loss_accum / ddp_world_size
@@ -136,6 +137,11 @@ def train(
                 val_loss_value = val_loss_accum.item()
                 print(f"[step {step}] val loss: {val_loss_value:.4f}")
                 wandb.log({"val_loss": val_loss_value}, step=step)
+                # log additional fields if present
+                if 'ce_loss' in losses:
+                    wandb.log({"val_ce_loss": losses['ce_loss'].item()}, step=step)
+                if 'moe_loss' in losses:
+                    wandb.log({"val_moe_loss": losses['moe_loss'].item()}, step=step)
 
         # --- Evaluate HellaSwag (if desired and not compiled)
         if do_hellaswag and (step % 250 == 0 or last_step):
@@ -217,10 +223,10 @@ def train(
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, loss = model(x, y)
-            loss = loss / grad_accum_steps
-            loss_accum += loss.detach().float()
-            loss.backward()
+                logits, losses = model(x, y)
+            main_loss = losses['loss'] / grad_accum_steps
+            loss_accum += main_loss.detach().float()
+            main_loss.backward()
 
         # gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -249,6 +255,11 @@ def train(
             bar.update(1)
 
             wandb.log({"train_loss": train_loss_val, "lr": lr}, step=step)
+            # log additional fields if present
+            if 'ce_loss' in losses:
+                wandb.log({"train_ce_loss": losses['ce_loss'].item()}, step=step)
+            if 'moe_loss' in losses:
+                wandb.log({"train_moe_loss": losses['moe_loss'].item()}, step=step)
 
         # (Optional) save checkpoint
         if master_process and (step % 5000 == 0 or last_step):

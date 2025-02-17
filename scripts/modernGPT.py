@@ -306,7 +306,7 @@ class ModernGPT(nn.Module):
                 ignore_index=-1
             )
 
-        return logits, loss
+        return logits, {'loss': loss}
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type, master_process=True):
         import inspect

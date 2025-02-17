@@ -292,7 +292,7 @@ class nGPT(nn.Module):
             # standard cross entropy
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-        return logits, loss
+        return logits, {'loss': loss}
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type, master_process=True):
         """

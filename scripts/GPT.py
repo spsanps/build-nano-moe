@@ -120,7 +120,7 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits, loss
+        return logits, {'loss': loss}
 
     @classmethod
     def from_pretrained(cls, model_type):
