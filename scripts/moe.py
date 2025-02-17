@@ -2,6 +2,7 @@
 # based on: https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 # Does not implement Multiheaded Latent Attention (MLA)
 
+
 import math
 import torch
 import torch.nn as nn
@@ -56,6 +57,9 @@ class MoeGPTConfig:
 ################################################################
 
 def build_sin_cos_rope(seq_len, head_dim, base=10000.0, device=None, dtype=None):
+    """
+    Creates [seq_len, head_dim] containing interleaved sin/cos frequencies.
+    """
     if device is None:
         device = torch.device("cpu")
     if dtype is None:
@@ -80,6 +84,7 @@ def apply_rope(x, rope_cache):
     sincos = rope_cache.unsqueeze(0).unsqueeze(0)  # shape [1,1,T,head_dim]
     sin = sincos[..., 0::2]
     cos = sincos[..., 1::2]
+
     x0 = x[..., 0::2]
     x1 = x[..., 1::2]
 
@@ -91,7 +96,6 @@ def apply_rope(x, rope_cache):
     out[..., 1::2] = out1
     return out
 
-
 ################################################################
 # RMSNorm
 ################################################################
@@ -101,40 +105,45 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+
     def forward(self, x):
         # x: (B, T, dim)
         norm = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(norm + self.eps)
         return self.weight * x
 
-
 ################################################################
-# MoEMLP
+# Expert
 ################################################################
 
 class Expert(nn.Module):
     """
     A single MoE Expert feed-forward:
-    [ (W1 & W3) => SwiGLU => W2 ] 
-    dimension expansions by ffn_factor
+      out = W2( [W1(x) * silu(W3(x))] ).
+    We optimize by fusing W1 & W3 into a single linear => c_fc => 2*hidden_dim => chunk => a,b
+    Then out = W2(a*silu(b)).
     """
     def __init__(self, config: MoeGPTConfig):
         super().__init__()
         hidden_dim = config.ffn_factor * config.n_embd
-        self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=config.use_bias)
-        self.w2 = nn.Linear(hidden_dim, config.n_embd, bias=config.use_bias)
-        self.w3 = nn.Linear(config.n_embd, hidden_dim, bias=config.use_bias)
+        # Fused W1 & W3 => shape: (n_embd -> 2*hidden_dim)
+        # Then we chunk => a, b => a * silu(b)
+        self.c_fc = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.use_bias)
+        self.w2   = nn.Linear(hidden_dim, config.n_embd, bias=config.use_bias)
         self.drop = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        # x shape: [num_selected, n_embd]
-        a = self.w1(x)
-        b = self.w3(x)
-        out = F.silu(b) * a
-        out = self.w2(out)
+        # x: [num_tokens_assigned, n_embd]
+        fc_out = self.c_fc(x)  # => [num_tokens_assigned, 2*hidden_dim]
+        a, b = fc_out.chunk(2, dim=-1)
+        ab = a * F.silu(b)
+        out = self.w2(ab)
         out = self.drop(out)
         return out
 
+################################################################
+# MoEMLP
+################################################################
 
 class MoEMLP(nn.Module):
     """
@@ -165,7 +174,7 @@ class MoEMLP(nn.Module):
         self.route_scale = config.route_scale
         self.gate_linear = nn.Linear(self.dim, self.n_total_experts, bias=True)
 
-        # build experts
+        # build experts (each is now the fused Expert)
         self.experts = nn.ModuleList([Expert(config) for _ in range(self.n_total_experts)])
 
         self.moe_loss_weight = config.moe_loss_weight
@@ -187,8 +196,8 @@ class MoEMLP(nn.Module):
             scores = torch.sigmoid(logits)
 
         # separate "always active" vs. "routable"
-        scores_shared    = scores[:, :self.n_shared]           # shape (N, n_shared)
-        scores_routable = scores[:, self.n_shared:]           # shape (N, n_total_experts - n_shared)
+        scores_shared    = scores[:, :self.n_shared]    # shape (N, n_shared)
+        scores_routable = scores[:, self.n_shared:]     # shape (N, n_total_experts - n_shared)
 
         topk_vals, topk_idx = torch.topk(scores_routable, k=self.k, dim=-1)
         # offset topk indices
@@ -202,25 +211,25 @@ class MoEMLP(nn.Module):
         # scale
         all_weights = all_weights * self.route_scale
 
-        # We'll track usage counts & score sums for each expert
+        # track usage & sums
         usage_count = torch.zeros(self.n_total_experts, dtype=torch.long, device=x.device)
         score_sum   = torch.zeros(self.n_total_experts, dtype=scores.dtype, device=x.device)
 
-        # flatten them
+        # Flatten them
         row_ids  = torch.arange(N, device=x.device).unsqueeze(-1).expand(N, self.n_shared + self.k).reshape(-1)
         exp_ids  = all_indices.reshape(-1)
         gate_wts = all_weights.reshape(-1)
 
-        # 1) sort by exp_ids => group tokens that go to the same expert
+        # Sort by exp_ids => group tokens that go to the same expert
         sorted_exp_ids, sort_idx = torch.sort(exp_ids)
         sorted_rows   = row_ids[sort_idx]
         sorted_w      = gate_wts[sort_idx]
-        sorted_x      = xflat[sorted_rows]  # gather inputs
+        sorted_x      = xflat[sorted_rows]
 
-        # We'll store the forward outputs in a parallel buffer
+        # We'll store forward outputs in parallel
         outbuf = torch.zeros_like(sorted_x)
 
-        # find boundaries
+        # Boundaries
         boundaries = torch.where(sorted_exp_ids[:-1] != sorted_exp_ids[1:])[0] + 1
         boundaries = torch.cat([
             torch.tensor([0], device=x.device),
@@ -233,71 +242,65 @@ class MoEMLP(nn.Module):
             end_i   = boundaries[b+1].item()
             e_id    = sorted_exp_ids[start_i].item()
 
-            chunk_x = sorted_x[start_i:end_i]  # input subset
+            chunk_x = sorted_x[start_i:end_i]
             chunk_w = sorted_w[start_i:end_i]
-            # forward
+            # forward pass
             y = self.experts[e_id](chunk_x)  # shape [num_sel, C]
-            # scale
+            # scale by gating
             y = y * chunk_w.unsqueeze(-1)
 
             outbuf[start_i:end_i] = y
 
             # usage
             usage_count[e_id] += (end_i - start_i)
-            # gating score sum
             score_sum[e_id]   += chunk_w.sum()
 
-        # unsort back to original token order
+        # unsort back
         inv_sort = torch.empty_like(sort_idx)
         inv_sort[sort_idx] = torch.arange(len(sort_idx), device=x.device)
-        final_buf = outbuf[inv_sort]  # shape [n_sel, C]
+        final_buf = outbuf[inv_sort]
 
-        # 2) scatter_add into out
-        # We create zero, do scatter_add_ => no gradient in-place error
+        # scatter back
         outflat = torch.zeros_like(xflat)
-        row_ids_expanded = row_ids.unsqueeze(-1).expand(-1, C)  # shape [N*(n_shared+k), C]
+        row_ids_expanded = row_ids.unsqueeze(-1).expand(-1, C)
         outflat.scatter_add_(0, row_ids_expanded, final_buf)
 
         out = outflat.view(B, T, C)
 
         # ~~~~~ balance loss ~~~~~
-        # usage_f = (n_ex / ((n_shared + k)*N)) * usage_count
+        # usage_f = (n_ex / (Kp*N)) * usage_count
         # score_p = (1/N) * score_sum
-        # L_expbal = sum over i=1..n_ex of usage_f[i]*score_p[i]
-        # scaled by self.moe_loss_weight
-        n_ex  = float(self.n_total_experts)
-        Kp    = float(self.n_shared + self.k)
+        # L_expbal = sum over i=1..n_ex of usage_f[i] * score_p[i]
+        n_ex = float(self.n_total_experts)
+        Kp = float(self.n_shared + self.k)
         usage_f = (n_ex / (Kp*N)) * usage_count.float()
         score_p = (1.0 / N) * score_sum
         bal_loss = (usage_f * score_p).sum()
 
         return out, bal_loss
 
-
 ################################################################
-# CausalSelfAttention (standard MHA)
+# CausalSelfAttention (optimized)
 ################################################################
 
 class CausalSelfAttention(nn.Module):
     """
-    Standard GPT-like attention:
-    - n_head heads
-    - n_embd dim total
-    - Fused Q,K,V in a single linear
+    Standard GPT-like multi-head attention with single fused Q,K,V.
+    Now uses torch.scaled_dot_product_attention with is_causal=True (PyTorch 2.0+).
     """
     def __init__(self, config: MoeGPTConfig):
         super().__init__()
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
-        assert config.n_embd % config.n_head == 0
 
+        # single fused Q/K/V linear
         total_out_dim = 3 * config.n_embd
         self.c_qkv = nn.Linear(config.n_embd, total_out_dim, bias=config.use_bias)
 
         self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.use_bias)
         self.resid_drop = nn.Dropout(config.dropout)
 
-        self.scale_attn = 1.0 / math.sqrt(self.head_dim)
+        # Note: scaled_dot_product_attention in PyTorch does the sqrt(d) scaling internally
 
     def forward(self, x, rope_cache=None):
         B, T, C = x.shape
@@ -305,7 +308,7 @@ class CausalSelfAttention(nn.Module):
         q, k, v = torch.split(qkv, C, dim=-1)
 
         # reshape => [B, n_head, T, head_dim]
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B,n_head,T,h)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # [B,n_head,T,hd]
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
@@ -314,21 +317,14 @@ class CausalSelfAttention(nn.Module):
             q = apply_rope(q, rope_cache[:T])
             k = apply_rope(k, rope_cache[:T])
 
-        # scaled dot product
-        q = q * self.scale_attn
-        att = torch.matmul(q, k.transpose(-2, -1))  # (B,n_head,T,T)
-        # causal mask
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1)
-        att = att.masked_fill(mask==1, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        out = torch.matmul(att, v)  # (B,n_head,T,h)
+        # PyTorch 2.0 scaled_dot_product_attention with is_causal
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # [B,n_head,T,hd]
 
         # reassemble
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.out_proj(out)
-        out = self.resid_drop(out)
-        return out
-
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.out_proj(y)
+        y = self.resid_drop(y)
+        return y
 
 ################################################################
 # Block
@@ -337,25 +333,23 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     """
     GPT block:
-    1) x + attn( LN1(x) )
-    2) x + MoEMLP( LN2(x) )
+      1) x + attn( LN1(x) )
+      2) x + MoEMLP( LN2(x) )
     """
     def __init__(self, config: MoeGPTConfig):
         super().__init__()
         self.ln1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln2 = RMSNorm(config.n_embd)
-        self.mlp = MoEMLP(config)  # always MoE
+        self.mlp = MoEMLP(config)
 
     def forward(self, x, rope_cache=None):
         # Self-attn
         x = x + self.attn(self.ln1(x), rope_cache=rope_cache)
-
         # MoE => returns (out, bal_loss)
         out, bal_loss = self.mlp(self.ln2(x))
         x = x + out
         return x, bal_loss
-
 
 ################################################################
 # MoeGPT
@@ -363,8 +357,8 @@ class Block(nn.Module):
 
 class MoeGPT(nn.Module):
     """
-    GPT-like model with an MoEMLP feed-forward layer in each block.
-    Also accumulates the balance loss for each block in forward().
+    GPT-like model with an MoEMLP feed-forward layer in each block,
+    plus a sum of balance losses from each block.
     """
     def __init__(self, config: MoeGPTConfig):
         super().__init__()
@@ -426,7 +420,7 @@ class MoeGPT(nn.Module):
             targets.view(-1),
             ignore_index=-1
         )
-        # add balance loss
+        # add MoE balance loss
         loss = ce_loss + self.config.moe_loss_weight * total_bal_loss
         return logits, loss
 
