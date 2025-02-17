@@ -23,18 +23,18 @@ class MoeGPTConfig:
     vocab_size: int = 50304
 
     # Transformer architecture
-    n_layer: int = 8
+    n_layer: int = 12
     n_head: int = 8
     n_embd: int = 512
     dropout: float = 0.0
-    use_bias: bool = False  # Changed default to False
+    use_bias: bool = True  # Changed back to True
 
     # Rope scaling (for rotary embeddings)
     rope_scaling: float = 10000.0
 
     # MoE hyperparams
-    n_experts: int = 4           # total "macro-experts"
-    m_sub_experts: int = 1       # sub-experts per macro => total = n_experts*m_sub_experts
+    n_experts: int = 8          # total "macro-experts"
+    m_sub_experts: int = 1      # sub-experts per macro => total = n_experts*m_sub_experts
     n_shared_experts: int = 1    # how many "macro" experts are always active
     n_activated_experts: int = 2 # top-k gating among the rest
 
@@ -146,9 +146,9 @@ class CausalSelfAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
-        # Remove bias from all linear layers
-        self.c_qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        # Restore bias in all linear layers
+        self.c_qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.use_bias)
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.use_bias)
         # Initialize output projection to zero
         nn.init.zeros_(self.out_proj.weight)
         self.resid_drop = nn.Dropout(config.dropout)
@@ -197,9 +197,9 @@ class Expert(nn.Module):
     def __init__(self, config: MoeGPTConfig):
         super().__init__()
         hidden_dim = config.ffn_factor * config.n_embd
-        # Remove bias from both layers
-        self.fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        # Restore bias in both layers
+        self.fc = nn.Linear(config.n_embd, hidden_dim, bias=config.use_bias)
+        self.proj = nn.Linear(hidden_dim, config.n_embd, bias=config.use_bias)
         # Initialize output projection to zero
         nn.init.zeros_(self.proj.weight)
         self.drop = nn.Dropout(config.dropout)
@@ -387,19 +387,21 @@ class MoEMLPParallel(nn.Module):
         self.hidden_dim = config.ffn_factor * config.n_embd
 
         # gating linear => (n_embd -> n_total_experts)
-        self.gate_linear = nn.Linear(self.dim, self.n_total_experts, bias=False)
+        self.gate_linear = nn.Linear(self.dim, self.n_total_experts, bias=config.use_bias)
 
-        # Single large parameter set:
-        #   fc_weight   => (n_experts, hidden_dim, n_embd)
-        #   proj_weight => (n_experts, n_embd, hidden_dim)
+        # Add back bias parameters
         self.fc_weight    = nn.Parameter(torch.zeros(self.n_total_experts, self.hidden_dim, self.dim))
+        self.fc_bias = nn.Parameter(torch.zeros(self.n_total_experts, self.hidden_dim))
         self.proj_weight  = nn.Parameter(torch.zeros(self.n_total_experts, self.dim, self.hidden_dim))
+        self.proj_bias = nn.Parameter(torch.zeros(self.n_total_experts, self.dim))
 
         self.drop = nn.Dropout(config.dropout)
 
         # init
         nn.init.normal_(self.fc_weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.proj_weight)  # Initialize output projection to zero
+        nn.init.zeros_(self.fc_bias)
+        nn.init.zeros_(self.proj_bias)
 
     def forward(self, x):
         """
@@ -447,12 +449,13 @@ class MoEMLPParallel(nn.Module):
         # 4) big parallel forward for all experts
         # fc_out => (N,e,h)
         fc_out = torch.einsum('nd,ehd->neh', xflat, self.fc_weight)
-        
+        fc_out = fc_out + self.fc_bias.unsqueeze(0)
         # activation
         hidden = F.relu(fc_out).square()  # => (N,e,h)
 
         # out_experts => (N,e,c)
         out_experts = torch.einsum('neh,edh->ned', hidden, self.proj_weight)
+        out_experts = out_experts + self.proj_bias.unsqueeze(0)
         out_experts = self.drop(out_experts)
 
         # Weighted sum => gating => shape(N,e)
